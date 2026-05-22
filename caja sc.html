@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>Caja SC</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f172a;font-family:Georgia,serif;min-height:100vh;padding-bottom:60px}
+  input:focus{outline:2px solid #3b82f6;outline-offset:1px}
+  button:active{opacity:0.8}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useReducer, useEffect, useRef } = React;
+
+const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyC2Rb2WbM4uEvHZIB84xtQnbYYzlOMciUwIK6YB6QLe83664B96MYCyr_1cIV4gMTp/exec";
+
+const CURRENCIES = {
+  COP: { symbol: "$", name: "Pesos", color: "#f59e0b" },
+  USD: { symbol: "US$", name: "Dólares", color: "#10b981" },
+};
+
+function formatNum(n, currency) {
+  return new Intl.NumberFormat("es-CO", {
+    minimumFractionDigits: currency === "USD" ? 2 : 0,
+    maximumFractionDigits: currency === "USD" ? 2 : 0,
+  }).format(n);
+}
+
+function todayStr() {
+  return new Date().toLocaleDateString("es-CO", { year:"numeric", month:"2-digit", day:"2-digit" });
+}
+
+function parseDate(s) {
+  const [d, m, y] = s.split("/");
+  return new Date(`${y}-${m}-${d}`);
+}
+
+const EMPTY_STATE = {
+  configured: false,
+  saldoInicial: { COP: 0, USD: 0 },
+  entries: [],
+  closedDays: [],
+};
+
+function loadLocal() {
+  try { const s = localStorage.getItem("caja-sc-v1"); return s ? JSON.parse(s) : null; } catch { return null; }
+}
+function saveLocal(state) {
+  try { localStorage.setItem("caja-sc-v1", JSON.stringify(state)); } catch {}
+}
+
+function getSaldoInicialDia(date, state) {
+  const allClosed = [...state.closedDays].sort((a,b) => parseDate(b.date) - parseDate(a.date));
+  const prevClosed = allClosed.find(d => parseDate(d.date) < parseDate(date));
+  return prevClosed ? prevClosed.saldoFinal : state.saldoInicial;
+}
+
+function calcSaldoFinal(date, state) {
+  const si = getSaldoInicialDia(date, state);
+  const result = { COP: si.COP, USD: si.USD };
+  state.entries.filter(e => e.date === date).forEach(e => {
+    result[e.currency] += e.type === "entrada" ? e.amount : -e.amount;
+  });
+  return result;
+}
+
+// Saldo acumulado hasta un entry específico en el día
+function getSaldoHastaEntry(entryId, date, state) {
+  const si = getSaldoInicialDia(date, state);
+  const saldo = { COP: si.COP, USD: si.USD };
+  // entries están en orden inverso (más nuevo primero), necesitamos orden cronológico
+  const dayEntries = [...state.entries.filter(e => e.date === date)].reverse();
+  for (const e of dayEntries) {
+    saldo[e.currency] += e.type === "entrada" ? e.amount : -e.amount;
+    if (e.id === entryId) break;
+  }
+  return saldo;
+}
+
+function reducer(state, action) {
+  switch (action.type) {
+    case "LOAD": return { ...action.payload };
+    case "CONFIGURE": return { ...state, configured: true, saldoInicial: action.saldoInicial };
+    case "ADD": return { ...state, entries: [{ id: Date.now(), ...action.payload }, ...state.entries] };
+    case "DELETE": return { ...state, entries: state.entries.filter(e => e.id !== action.id) };
+    case "EDIT": return {
+      ...state,
+      entries: state.entries.map(e => e.id === action.id ? { ...e, ...action.payload } : e)
+    };
+    case "CLOSE_DAY": {
+      const { date } = action;
+      if (state.closedDays.find(d => d.date === date)) return state;
+      const totals = { COP:{entrada:0,salida:0}, USD:{entrada:0,salida:0} };
+      state.entries.filter(e => e.date === date).forEach(e => { totals[e.currency][e.type] += e.amount; });
+      const saldoFinal = calcSaldoFinal(date, state);
+      return { ...state, closedDays: [...state.closedDays, {
+        date, totals, saldoFinal,
+        closedAt: new Date().toLocaleTimeString("es-CO", { hour:"2-digit", minute:"2-digit" })
+      }]};
+    }
+    case "REOPEN_DAY": return { ...state, closedDays: state.closedDays.filter(d => d.date !== action.date) };
+    default: return state;
+  }
+}
+
+async function syncLoad() {
+  const res = await fetch(SCRIPT_URL + "?t=" + Date.now());
+  const data = await res.json();
+  return (data.ok && data.state) ? data.state : null;
+}
+async function syncSave(state) {
+  await fetch(SCRIPT_URL, { method:"POST", body: JSON.stringify({ state }) });
+}
+
+// ── Modal de edición ──
+function EditModal({ entry, onSave, onClose }) {
+  const [name, setName] = useState(entry.name);
+  const [type, setType] = useState(entry.type);
+  const [currency, setCurrency] = useState(entry.currency);
+  const [amount, setAmount] = useState(String(entry.amount));
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:16 }}>
+      <div style={{ background:"#1e293b", borderRadius:18, padding:22, width:"100%", maxWidth:380, border:"1px solid #2d4a6b" }}>
+        <div style={{ fontSize:11, letterSpacing:3, color:"#64748b", textTransform:"uppercase", marginBottom:16 }}>Editar movimiento</div>
+
+        <input value={name} onChange={e => setName(e.target.value)}
+          style={{ width:"100%", background:"#0f172a", border:"1px solid #334155", borderRadius:10, padding:"10px 12px", color:"#f1f5f9", fontSize:14, outline:"none", marginBottom:12 }} />
+
+        <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:12 }}>
+          <div style={{ display:"flex", borderRadius:10, overflow:"hidden", border:"1px solid #334155" }}>
+            {["entrada","salida"].map(t => (
+              <button key={t} onClick={() => setType(t)}
+                style={{ flex:1, padding:"9px 0", fontSize:12, fontWeight:600, border:"none", cursor:"pointer",
+                  background:type===t ? (t==="entrada"?"#059669":"#dc2626") : "#0f172a",
+                  color:type===t?"#fff":"#64748b" }}>
+                {t==="entrada"?"↑ Entrada":"↓ Salida"}
+              </button>
+            ))}
+          </div>
+          <div style={{ display:"flex", borderRadius:10, overflow:"hidden", border:"1px solid #334155" }}>
+            {Object.entries(CURRENCIES).map(([cur, cfg]) => (
+              <button key={cur} onClick={() => setCurrency(cur)}
+                style={{ flex:1, padding:"9px 0", fontSize:12, fontWeight:600, border:"none", cursor:"pointer",
+                  background:currency===cur ? cfg.color:"#0f172a",
+                  color:currency===cur?"#000":"#64748b" }}>
+                {cfg.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <input type="number" inputMode="decimal" pattern="[0-9]*" value={amount} onChange={e => setAmount(e.target.value)}
+          style={{ width:"100%", background:"#0f172a", border:"1px solid #334155", borderRadius:10, padding:"10px 12px", color:"#f1f5f9", fontSize:14, outline:"none", marginBottom:16 }} />
+
+        <div style={{ display:"flex", gap:10 }}>
+          <button onClick={onClose}
+            style={{ flex:1, background:"#0f172a", color:"#94a3b8", border:"1px solid #334155", borderRadius:10, padding:"10px 0", fontSize:13, fontWeight:600, cursor:"pointer" }}>
+            Cancelar
+          </button>
+          <button onClick={() => {
+            if (!name.trim() || !amount || isNaN(amount) || Number(amount) <= 0) return;
+            onSave({ name, type, currency, amount: Number(amount) });
+          }}
+            style={{ flex:1, background:"linear-gradient(135deg,#3b82f6,#2563eb)", color:"#fff", border:"none", borderRadius:10, padding:"10px 0", fontSize:13, fontWeight:700, cursor:"pointer" }}>
+            Guardar
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SetupScreen({ onDone }) {
+  const [cop, setCop] = useState("");
+  const [usd, setUsd] = useState("");
+  return (
+    <div style={{ minHeight:"100vh", background:"#0f172a", display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+      <div style={{ background:"#1e293b", borderRadius:20, padding:28, maxWidth:360, width:"100%", border:"1px solid #2d4a6b" }}>
+        <div style={{ textAlign:"center", marginBottom:24 }}>
+          <div style={{ fontSize:36, marginBottom:8 }}>💵</div>
+          <h2 style={{ color:"#f1f5f9", fontSize:22, fontWeight:700 }}>Caja SC</h2>
+          <p style={{ color:"#64748b", fontSize:13, marginTop:6 }}>Ingresa el saldo con el que arrancas</p>
+        </div>
+        {["COP","USD"].map(cur => (
+          <div key={cur} style={{ marginBottom:14 }}>
+            <label style={{ fontSize:11, letterSpacing:3, color:CURRENCIES[cur].color, textTransform:"uppercase", display:"block", marginBottom:6 }}>
+              {CURRENCIES[cur].name} ({CURRENCIES[cur].symbol})
+            </label>
+            <input type="number" placeholder={cur==="COP"?"Ej: 500000":"Ej: 100"}
+              value={cur==="COP"?cop:usd} onChange={e => cur==="COP"?setCop(e.target.value):setUsd(e.target.value)}
+              style={{ width:"100%", background:"#0f172a", border:"1px solid #334155", borderRadius:10, padding:"11px 14px", color:"#f1f5f9", fontSize:15, outline:"none" }} />
+          </div>
+        ))}
+        <p style={{ color:"#475569", fontSize:11, marginBottom:16, textAlign:"center" }}>Si arrancas desde cero deja en 0</p>
+        <button onClick={() => onDone({ COP: parseFloat(cop)||0, USD: parseFloat(usd)||0 })}
+          style={{ width:"100%", background:"linear-gradient(135deg,#3b82f6,#2563eb)", color:"#fff", border:"none", borderRadius:12, padding:"13px 0", fontSize:15, fontWeight:700, cursor:"pointer" }}>
+          Iniciar Caja →
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [state, dispatch] = useReducer(reducer, null, () => loadLocal() || EMPTY_STATE);
+  const [form, setForm] = useState({ name:"", type:"entrada", currency:"COP", amount:"" });
+  const [filterCur, setFilterCur] = useState("ALL");
+  const [error, setError] = useState("");
+  const [expandedDays, setExpandedDays] = useState({});
+  const [syncStatus, setSyncStatus] = useState("idle");
+  const [editingEntry, setEditingEntry] = useState(null);
+  const syncTimer = useRef(null);
+  const isFirstLoad = useRef(true);
+
+  useEffect(() => {
+    setSyncStatus("loading");
+    syncLoad().then(s => {
+      if (s) { dispatch({ type:"LOAD", payload:s }); saveLocal(s); }
+      setSyncStatus("ok");
+    }).catch(() => setSyncStatus("error"));
+  }, []);
+
+  useEffect(() => {
+    if (isFirstLoad.current) { isFirstLoad.current = false; return; }
+    saveLocal(state);
+    setSyncStatus("loading");
+    clearTimeout(syncTimer.current);
+    syncTimer.current = setTimeout(() => {
+      syncSave(state).then(() => setSyncStatus("ok")).catch(() => setSyncStatus("error"));
+    }, 1500);
+  }, [state]);
+
+  if (!state.configured) return <SetupScreen onDone={si => dispatch({ type:"CONFIGURE", saldoInicial:si })} />;
+
+  const today = todayStr();
+  const siHoy = getSaldoInicialDia(today, state);
+  const todayEntries = state.entries.filter(e => e.date === today);
+  const todayTotals = { COP:{entrada:0,salida:0}, USD:{entrada:0,salida:0} };
+  todayEntries.forEach(e => { todayTotals[e.currency][e.type] += e.amount; });
+  const saldoHoy = {
+    COP: siHoy.COP + todayTotals.COP.entrada - todayTotals.COP.salida,
+    USD: siHoy.USD + todayTotals.USD.entrada - todayTotals.USD.salida,
+  };
+
+  const handleSubmit = () => {
+    if (!form.name.trim()) { setError("Escribe un nombre"); return; }
+    if (!form.amount || isNaN(form.amount) || Number(form.amount) <= 0) { setError("Cantidad inválida"); return; }
+    if (state.closedDays.find(d => d.date === today)) { setError("El día de hoy ya está cerrado."); return; }
+    setError("");
+    dispatch({ type:"ADD", payload: { ...form, amount: Number(form.amount), date: today } });
+    setForm({ name:"", type:"entrada", currency:form.currency, amount:"" });
+  };
+
+  const allDates = [...new Set(state.entries.map(e => e.date))].sort((a,b) => parseDate(b) - parseDate(a));
+  const isClosed = date => !!state.closedDays.find(d => d.date === date);
+  const isExpanded = date => expandedDays[date] !== false;
+  const toggleDay = date => setExpandedDays(p => ({ ...p, [date]: p[date] === undefined ? false : !p[date] }));
+
+  const dayTotals = date => {
+    const t = { COP:{entrada:0,salida:0}, USD:{entrada:0,salida:0} };
+    state.entries.filter(e => e.date === date).forEach(e => { t[e.currency][e.type] += e.amount; });
+    return t;
+  };
+
+  const filtered = date => {
+    const de = state.entries.filter(e => e.date === date);
+    return filterCur === "ALL" ? de : de.filter(e => e.currency === filterCur);
+  };
+
+  const syncColors = { idle:"#475569", loading:"#f59e0b", ok:"#4ade80", error:"#f87171" };
+  const syncLabels = { idle:"Sin cambios", loading:"Guardando...", ok:"Guardado ✓", error:"Sin conexión" };
+  const inp = { background:"#0f172a", border:"1px solid #334155", borderRadius:10, padding:"10px 12px", color:"#f1f5f9", fontSize:14, outline:"none" };
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#0f172a", paddingBottom:60 }}>
+      <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}`}</style>
+
+      {editingEntry && (
+        <EditModal
+          entry={editingEntry}
+          onSave={payload => { dispatch({ type:"EDIT", id:editingEntry.id, payload }); setEditingEntry(null); }}
+          onClose={() => setEditingEntry(null)}
+        />
+      )}
+
+      {/* Header */}
+      <div style={{ background:"linear-gradient(135deg,#1e293b,#0f172a)", borderBottom:"1px solid #1e3a5f", padding:"22px 20px 16px", textAlign:"center" }}>
+        <div style={{ fontSize:11, letterSpacing:6, color:"#64748b", textTransform:"uppercase", marginBottom:4 }}>Control de</div>
+        <h1 style={{ fontSize:28, fontWeight:700, color:"#f1f5f9", letterSpacing:-1 }}>Caja SC 💵</h1>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:6, marginTop:8 }}>
+          <div style={{ width:7, height:7, borderRadius:"50%", background:syncColors[syncStatus],
+            boxShadow:syncStatus==="ok"?"0 0 6px #4ade80":"none",
+            animation:syncStatus==="loading"?"pulse 1s infinite":"none" }} />
+          <span style={{ fontSize:10, color:syncColors[syncStatus], letterSpacing:1 }}>{syncLabels[syncStatus]}</span>
+          <button onClick={() => { setSyncStatus("loading"); syncLoad().then(s => { if(s){ dispatch({type:"LOAD",payload:s}); saveLocal(s); } setSyncStatus("ok"); }).catch(()=>setSyncStatus("error")); }}
+            style={{ background:"none", border:"none", color:"#475569", cursor:"pointer", fontSize:13, padding:"0 4px" }}>↺</button>
+        </div>
+      </div>
+
+      <div style={{ maxWidth:480, margin:"0 auto", padding:"0 16px" }}>
+
+        {/* Saldo de hoy */}
+        <div style={{ marginTop:18 }}>
+          <div style={{ fontSize:10, letterSpacing:4, color:"#64748b", textTransform:"uppercase", marginBottom:10 }}>
+            📅 Hoy · {today} {isClosed(today) && <span style={{ color:"#60a5fa" }}>· Cerrado</span>}
+          </div>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+            {Object.entries(CURRENCIES).map(([cur, cfg]) => {
+              const bal = saldoHoy[cur];
+              return (
+                <div key={cur} style={{ background:"#1e293b", borderRadius:16, padding:"15px 13px", border:`1px solid ${bal>=0?"#1e3a5f":"#450a0a"}` }}>
+                  <div style={{ fontSize:10, letterSpacing:3, color:"#64748b", textTransform:"uppercase" }}>{cfg.name}</div>
+                  <div style={{ fontSize:22, fontWeight:700, color:bal>=0?cfg.color:"#f87171", marginTop:5, lineHeight:1 }}>
+                    {cfg.symbol}{formatNum(Math.abs(bal), cur)}
+                  </div>
+                  <div style={{ fontSize:10, color:"#475569", marginTop:5 }}>Inicio: {cfg.symbol}{formatNum(siHoy[cur], cur)}</div>
+                  <div style={{ marginTop:8, display:"flex", justifyContent:"space-between", fontSize:10 }}>
+                    <span style={{ color:"#4ade80" }}>↑ {cfg.symbol}{formatNum(todayTotals[cur].entrada, cur)}</span>
+                    <span style={{ color:"#f87171" }}>↓ {cfg.symbol}{formatNum(todayTotals[cur].salida, cur)}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Formulario */}
+        <div style={{ background:"#1e293b", borderRadius:16, padding:18, marginTop:14, border:"1px solid #1e3a5f" }}>
+          <div style={{ fontSize:11, letterSpacing:3, color:"#64748b", textTransform:"uppercase", marginBottom:12 }}>Nueva transacción</div>
+          <input value={form.name} onChange={e => setForm({...form, name:e.target.value})}
+            placeholder="Nombre / descripción" style={{ ...inp, width:"100%", boxSizing:"border-box", marginBottom:10 }} />
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:10 }}>
+            <div style={{ display:"flex", borderRadius:10, overflow:"hidden", border:"1px solid #334155" }}>
+              {["entrada","salida"].map(t => (
+                <button key={t} onClick={() => setForm({...form, type:t})}
+                  style={{ flex:1, padding:"9px 0", fontSize:12, fontWeight:600, border:"none", cursor:"pointer",
+                    background:form.type===t?(t==="entrada"?"#059669":"#dc2626"):"#0f172a",
+                    color:form.type===t?"#fff":"#64748b" }}>
+                  {t==="entrada"?"↑ Entrada":"↓ Salida"}
+                </button>
+              ))}
+            </div>
+            <div style={{ display:"flex", borderRadius:10, overflow:"hidden", border:"1px solid #334155" }}>
+              {Object.entries(CURRENCIES).map(([cur, cfg]) => (
+                <button key={cur} onClick={() => setForm({...form, currency:cur})}
+                  style={{ flex:1, padding:"9px 0", fontSize:12, fontWeight:600, border:"none", cursor:"pointer",
+                    background:form.currency===cur?cfg.color:"#0f172a",
+                    color:form.currency===cur?"#000":"#64748b" }}>
+                  {cfg.name}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display:"flex", gap:10 }}>
+            <input type="number" inputMode="decimal" pattern="[0-9]*" value={form.amount} onChange={e => setForm({...form, amount:e.target.value})}
+              placeholder="Cantidad" style={{ ...inp, flex:1 }} />
+            <button onClick={handleSubmit}
+              style={{ background:"linear-gradient(135deg,#3b82f6,#2563eb)", color:"#fff", border:"none", borderRadius:10, padding:"10px 20px", fontSize:14, fontWeight:700, cursor:"pointer" }}>
+              + Agregar
+            </button>
+          </div>
+          {error && <div style={{ color:"#f87171", fontSize:12, marginTop:8 }}>{error}</div>}
+        </div>
+
+        {/* Filtro */}
+        {state.entries.length > 0 && (
+          <div style={{ display:"flex", gap:8, marginTop:14, justifyContent:"flex-end" }}>
+            {["ALL","COP","USD"].map(f => (
+              <button key={f} onClick={() => setFilterCur(f)}
+                style={{ padding:"5px 14px", borderRadius:20, fontSize:11, border:"1px solid #334155", cursor:"pointer",
+                  background:filterCur===f?"#3b82f6":"#1e293b", color:filterCur===f?"#fff":"#94a3b8", fontWeight:600 }}>
+                {f==="ALL"?"Todas":CURRENCIES[f].name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {state.entries.length === 0 && (
+          <div style={{ textAlign:"center", color:"#475569", marginTop:40, fontSize:14 }}>
+            <div style={{ fontSize:36, marginBottom:8 }}>💵</div>
+            Agrega tu primer movimiento
+          </div>
+        )}
+
+        {/* Días agrupados */}
+        {allDates.map(date => {
+          const dt = dayTotals(date);
+          const closed = isClosed(date);
+          const closedInfo = state.closedDays.find(d => d.date === date);
+          const expanded = isExpanded(date);
+          const isToday = date === today;
+          const si = getSaldoInicialDia(date, state);
+          const sf = closed ? closedInfo.saldoFinal : calcSaldoFinal(date, state);
+          const dayFiltered = filtered(date);
+
+          // Saldo acumulado por cada entry en orden cronológico
+          const saldosPorEntry = {};
+          const chronological = [...state.entries.filter(e => e.date === date)].reverse();
+          const runSaldo = { COP: si.COP, USD: si.USD };
+          chronological.forEach(e => {
+            runSaldo[e.currency] += e.type === "entrada" ? e.amount : -e.amount;
+            saldosPorEntry[e.id] = { ...runSaldo };
+          });
+
+          return (
+            <div key={date} style={{ marginTop:14 }}>
+              <div style={{ background:closed?"#0f2027":"#162032", borderRadius:14, border:`1px solid ${closed?"#1e3a5f":"#2d4a6b"}`, overflow:"hidden" }}>
+
+                {/* Cabecera */}
+                <div style={{ display:"flex", alignItems:"center", padding:"12px 14px", cursor:"pointer", gap:10 }} onClick={() => toggleDay(date)}>
+                  <div style={{ flex:1 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+                      <span style={{ fontSize:13, fontWeight:700, color:"#f1f5f9" }}>
+                        {isToday ? "📅 Hoy" : "📅 "+date}
+                      </span>
+                      {closed && <span style={{ fontSize:9, letterSpacing:2, background:"#1e3a5f", color:"#60a5fa", padding:"2px 7px", borderRadius:20, textTransform:"uppercase" }}>Cerrado · {closedInfo.closedAt}</span>}
+                      {!closed && isToday && <span style={{ fontSize:9, letterSpacing:2, background:"#064e3b", color:"#4ade80", padding:"2px 7px", borderRadius:20, textTransform:"uppercase" }}>Activo</span>}
+                    </div>
+                    {/* Saldos del día al lado de la fecha */}
+                    <div style={{ display:"flex", gap:10, marginTop:5, flexWrap:"wrap" }}>
+                      {Object.entries(CURRENCIES).map(([cur, cfg]) => (
+                        <div key={cur} style={{ display:"flex", alignItems:"center", gap:4 }}>
+                          <span style={{ fontSize:9, color:"#475569", textTransform:"uppercase", letterSpacing:1 }}>{cfg.name}:</span>
+                          <span style={{ fontSize:12, color:sf[cur]>=0?cfg.color:"#f87171", fontWeight:700 }}>
+                            {cfg.symbol}{formatNum(sf[cur], cur)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <span style={{ color:"#475569", fontSize:12 }}>{expanded?"▲":"▼"}</span>
+                </div>
+
+                {expanded && (
+                  <div style={{ borderTop:"1px solid #1e3a5f" }}>
+                    {/* Resumen del día */}
+                    <div style={{ padding:"10px 14px", background:"#0f172a" }}>
+                      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                        {Object.entries(CURRENCIES).map(([cur, cfg]) => (
+                          <div key={cur} style={{ background:"#1e293b", borderRadius:10, padding:"9px 11px" }}>
+                            <div style={{ fontSize:10, color:cfg.color, letterSpacing:2, textTransform:"uppercase", marginBottom:6 }}>{cfg.name}</div>
+                            <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, color:"#94a3b8", marginBottom:4 }}>
+                              <span>Inicio</span><span style={{ color:"#f1f5f9", fontWeight:600 }}>{cfg.symbol}{formatNum(si[cur], cur)}</span>
+                            </div>
+                            <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:4 }}>
+                              <span style={{ color:"#4ade80" }}>↑ Entradas</span><span style={{ color:"#4ade80" }}>{cfg.symbol}{formatNum(dt[cur].entrada, cur)}</span>
+                            </div>
+                            <div style={{ display:"flex", justifyContent:"space-between", fontSize:11, marginBottom:6 }}>
+                              <span style={{ color:"#f87171" }}>↓ Salidas</span><span style={{ color:"#f87171" }}>{cfg.symbol}{formatNum(dt[cur].salida, cur)}</span>
+                            </div>
+                            <div style={{ borderTop:"1px solid #334155", paddingTop:6, display:"flex", justifyContent:"space-between", fontSize:12 }}>
+                              <span style={{ color:"#94a3b8" }}>{closed?"Cierre":"Saldo"}</span>
+                              <span style={{ color:sf[cur]>=0?cfg.color:"#f87171", fontWeight:700 }}>{cfg.symbol}{formatNum(sf[cur], cur)}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Movimientos */}
+                    <div style={{ padding:"0 10px 10px" }}>
+                      {dayFiltered.length === 0
+                        ? <div style={{ color:"#475569", fontSize:12, textAlign:"center", padding:"10px 0" }}>Sin movimientos en esta moneda</div>
+                        : dayFiltered.map(e => {
+                          const cfg = CURRENCIES[e.currency];
+                          const saldoEntry = saldosPorEntry[e.id];
+                          return (
+                            <div key={e.id} style={{ background:"#1e293b", borderRadius:12, padding:"10px 12px", marginTop:6, opacity:closed?0.75:1 }}>
+                              <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+                                <div style={{ width:32, height:32, borderRadius:8, background:e.type==="entrada"?"#064e3b":"#450a0a", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, flexShrink:0 }}>
+                                  {e.type==="entrada"?"↑":"↓"}
+                                </div>
+                                <div style={{ flex:1, minWidth:0 }}>
+                                  <div style={{ color:"#f1f5f9", fontSize:13, fontWeight:600, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>{e.name}</div>
+                                  <div style={{ color:cfg.color, fontSize:10, marginTop:1 }}>{cfg.name}</div>
+                                </div>
+                                <div style={{ textAlign:"right", flexShrink:0 }}>
+                                  <div style={{ fontSize:14, fontWeight:700, color:e.type==="entrada"?"#4ade80":"#f87171" }}>
+                                    {e.type==="entrada"?"+":"-"}{cfg.symbol}{formatNum(e.amount, e.currency)}
+                                  </div>
+                                  {/* Saldo que va quedando */}
+                                  {saldoEntry && (
+                                    <div style={{ fontSize:10, color:saldoEntry[e.currency]>=0?cfg.color:"#f87171", marginTop:2 }}>
+                                      = {cfg.symbol}{formatNum(saldoEntry[e.currency], e.currency)}
+                                    </div>
+                                  )}
+                                </div>
+                                {!closed && (
+                                  <div style={{ display:"flex", flexDirection:"column", gap:4, flexShrink:0 }}>
+                                    <button onClick={() => setEditingEntry(e)}
+                                      style={{ background:"rgba(59,130,246,0.15)", border:"none", color:"#60a5fa", cursor:"pointer", fontSize:12, padding:"4px 8px", borderRadius:6 }}>✏</button>
+                                    <button onClick={() => dispatch({ type:"DELETE", id:e.id })}
+                                      style={{ background:"rgba(239,68,68,0.1)", border:"none", color:"#f87171", cursor:"pointer", fontSize:12, padding:"4px 8px", borderRadius:6 }}>✕</button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })
+                      }
+                    </div>
+
+                    {/* Cerrar / Reabrir */}
+                    <div style={{ padding:"0 10px 12px", display:"flex", justifyContent:"flex-end" }}>
+                      {!closed ? (
+                        <button onClick={() => {
+                          if (confirm(`¿Cerrar el día ${date}?\nEl saldo final pasará como saldo inicial del día siguiente.`))
+                            dispatch({ type:"CLOSE_DAY", date });
+                        }}
+                          style={{ background:"linear-gradient(135deg,#1d4ed8,#1e40af)", color:"#fff", border:"none", borderRadius:10, padding:"8px 18px", fontSize:12, fontWeight:700, cursor:"pointer" }}>
+                          🔒 Cerrar día
+                        </button>
+                      ) : (
+                        <button onClick={() => { if(confirm(`¿Reabrir el día ${date}?`)) dispatch({ type:"REOPEN_DAY", date }); }}
+                          style={{ background:"#1e293b", color:"#94a3b8", border:"1px solid #334155", borderRadius:10, padding:"8px 18px", fontSize:12, fontWeight:600, cursor:"pointer" }}>
+                          🔓 Reabrir día
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
